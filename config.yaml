@@ -1,0 +1,338 @@
+# Moonshot Detector Configuration
+# All data sources are FREE - no paid subscriptions
+
+project:
+  name: "moonshot-detector"
+  version: "0.1.0-scrappy"
+  description: "ML system for detecting explosive 20-50%+ gains in 4-8 weeks using only free data"
+
+data:
+  date_ranges:
+    training_start: "2015-01-01"
+    training_end: "2024-01-01"
+    test_start: "2024-01-01"
+    test_end: "2025-11-06"
+
+  sources:
+    stocks:
+      price_source: "yfinance"
+      fundamentals_source: "sec_edgar"
+      short_interest_source: "finra"
+      rate_limits:
+        yfinance_requests_per_second: 2
+        edgar_requests_per_second: 10
+
+    crypto:
+      price_source: "ccxt"
+      market_data_source: "coingecko"
+      on_chain_source: "disabled"
+      exchange: "binance"
+      rate_limits:
+        ccxt_requests_per_second: 1
+        coingecko_requests_per_minute: 50
+
+    sentiment:
+      reddit_source: "praw"
+      trends_source: "pytrends"
+      subreddits:
+        - "wallstreetbets"
+        - "stocks"
+        - "investing"
+        - "cryptocurrency"
+        - "CryptoMoonShots"
+      rate_limits:
+        reddit_requests_per_minute: 60
+
+    economic:
+      source: "fred"
+      series:
+        - "VIXCLS"
+        - "DGS10"
+        - "UNRATE"
+        - "GDP"
+
+  universe:
+    stocks:
+      source: "sp500"
+      filters:
+        min_price: 5.0
+        min_daily_volume_usd: 2000000
+        min_market_cap_usd: 300000000
+        exclude_sectors: []
+      max_tickers: 500
+
+    crypto:
+      source: "top50_by_marketcap"
+      exchange: "binance"
+      filters:
+        min_daily_volume_usd: 20000000
+        min_market_cap_usd: 100000000
+      max_pairs: 50
+
+models:
+  model_1_breakout:
+    name: "Technical Breakout Classifier"
+    enabled: true
+    algorithm: "xgboost"
+    features:
+      - "rsi_14"
+      - "macd"
+      - "macd_signal"
+      - "macd_histogram"
+      - "adx_20"
+      - "obv"
+      - "volume_spike_ratio"
+      - "rvol"
+      - "bbw"
+      - "bbw_percentile_100d"
+      - "atr_14"
+      - "price_to_52w_high"
+      - "ema_20_cross"
+      - "ema_50_cross"
+    target:
+      type: "triple_barrier"
+      profit_target_pct: 20
+      stop_loss_pct: 10
+      timeframe_days: 30
+    hyperparameters:
+      n_estimators: 300
+      max_depth: 6
+      learning_rate: 0.05
+      subsample: 0.8
+
+  model_2_volatility:
+    name: "Volatility Squeeze Detector"
+    enabled: true
+    algorithm: "svm"
+    features:
+      - "bbw_percentile_100d"
+      - "atr_percentile_100d"
+      - "keltner_width"
+      - "price_range_percentile"
+    target:
+      type: "volatility_expansion"
+      expansion_multiple: 2.0
+      timeframe_days: 20
+    hyperparameters:
+      kernel: "rbf"
+      C: 1.0
+      gamma: "scale"
+
+  model_3_pead_squeeze:
+    name: "PEAD + Short Squeeze Hybrid"
+    enabled: true
+    algorithm: "xgboost"
+    components:
+      pead:
+        enabled: true
+        features:
+          - "earnings_surprise_std"
+          - "revenue_surprise_pct"
+          - "eps_growth_yoy"
+          - "eps_growth_qoq"
+          - "analyst_upgrades_5d"
+          - "days_since_earnings"
+          - "days_to_next_earnings"
+      squeeze:
+        enabled: true
+        features:
+          - "short_interest_pct"
+          - "days_to_cover"
+          - "short_interest_change_pct"
+          - "reddit_mentions_7d"
+          - "reddit_mentions_velocity"
+          - "reddit_sentiment"
+          - "volume_spike_on_uptick"
+    target:
+      type: "triple_barrier"
+      profit_target_pct: 30
+      stop_loss_pct: 10
+      timeframe_days: 60
+    hyperparameters:
+      n_estimators: 400
+      max_depth: 8
+      learning_rate: 0.03
+
+  model_4_garp:
+    name: "GARP Fundamental Filter"
+    enabled: true
+    algorithm: "random_forest"
+    role: "filter"
+    features:
+      - "peg_ratio"
+      - "ps_ratio"
+      - "eps_growth_yoy"
+      - "revenue_growth_yoy"
+      - "roe"
+      - "profit_margin"
+      - "debt_to_equity"
+      - "current_ratio"
+    threshold_score: 80
+    hyperparameters:
+      n_estimators: 200
+      max_depth: 10
+      min_samples_split: 20
+
+  model_5_onchain:
+    name: "Crypto On-Chain Analyst"
+    enabled: false
+    note: "Add after first $5k profit - requires Glassnode subscription ($29-799/mo)"
+    algorithm: "lstm"
+    features_when_enabled:
+      - "exchange_netflow"
+      - "whale_transfers"
+      - "active_addresses_7d"
+      - "mvrv_zscore"
+      - "nvt_ratio"
+      - "funding_rate"
+
+  model_6_anomaly:
+    name: "Anomaly / Regime Detector"
+    enabled: true
+    algorithm: "isolation_forest"
+    unsupervised: true
+    features:
+      - "price_zscore_60d"
+      - "volume_zscore_60d"
+      - "returns_zscore_60d"
+      - "vix_level"
+      - "market_correlation_30d"
+      - "sector_relative_strength"
+    hyperparameters:
+      contamination: 0.1
+      n_estimators: 100
+
+ensemble:
+  voting_method: "weighted"
+  weight_update_frequency: "monthly"
+
+  stocks:
+    models_participating: [1, 2, 3, 4, 6]
+    min_models_required: 3
+    confidence_tiers:
+      high: 0.85
+      medium: 0.70
+      low: 0.55
+
+  crypto:
+    models_participating: [1, 2, 6]
+    min_models_required: 2
+    confidence_tiers:
+      high: 0.80
+      medium: 0.65
+      low: 0.50
+
+backtesting:
+  method: "walk_forward"
+  train_window_years: 4
+  test_window_months: 12
+  step_size_months: 3
+
+  validation_requirements:
+    min_t_statistic: 3.0
+    max_pbo: 0.30
+    min_trades: 50
+
+  transaction_costs:
+    stocks:
+      expected_bps: 10
+      test_at_bps: 20
+      fixed_commission_usd: 0
+    crypto:
+      expected_bps: 25
+      test_at_bps: 50
+      exchange_fee_pct: 0.1
+
+  slippage_model:
+    stocks:
+      liquid_large_cap_bps: 5
+      mid_cap_bps: 10
+      small_cap_bps: 20
+    crypto:
+      top10_bps: 10
+      top50_bps: 25
+      others_bps: 50
+
+paper_trading:
+  enabled: true
+  duration_months_minimum: 3
+  broker: "alpaca"
+  starting_capital_usd: 100000
+
+  validation_criteria:
+    max_performance_gap_pct: 20
+    max_slippage_vs_model_pct: 25
+    min_sharpe_ratio: 1.0
+    max_drawdown_pct: 25
+
+risk_management:
+  position_sizing:
+    max_single_position_pct: 2.0
+    max_sector_concentration_pct: 20.0
+    max_explosive_strategies_pct: 15.0
+
+  stop_losses:
+    stocks:
+      initial_stop_pct: 10.0
+      trailing_stop_pct: 15.0
+      move_to_breakeven_at_pct: 10.0
+    crypto:
+      initial_stop_pct: 15.0
+      trailing_stop_pct: 20.0
+      move_to_breakeven_at_pct: 15.0
+
+  circuit_breakers:
+    max_daily_loss_pct: 2.0
+    max_weekly_loss_pct: 5.0
+    max_monthly_loss_pct: 10.0
+
+  volatility_scaling:
+    enabled: true
+    lookback_days: 20
+    scale_method: "inverse"
+
+execution:
+  order_type: "limit"
+  limit_price_offset_pct: 0.1
+  time_in_force: "day"
+  max_position_size_pct_of_volume: 1.0
+
+aws:
+  target_monthly_cost_usd: 15
+  region: "us-east-1"
+  s3:
+    bucket_name: ""
+    data_path: "moonshot-detector/data/"
+    models_path: "moonshot-detector/models/"
+  lambda:
+    memory_mb: 512
+    timeout_seconds: 300
+  dynamodb:
+    table_name: "moonshot-signals"
+
+logging:
+  level: "INFO"
+  format: "json"
+  handlers:
+    - "console"
+    - "file"
+  files:
+    data_collection: "logs/data_collection.log"
+    training: "logs/training.log"
+    backtest: "logs/backtest.log"
+    inference: "logs/inference.log"
+    paper_trading: "logs/paper_trading.log"
+
+monitoring:
+  track_metrics:
+    - "model_accuracy"
+    - "feature_importance_drift"
+    - "prediction_confidence"
+    - "realized_returns"
+    - "realized_slippage"
+    - "transaction_costs"
+
+  alerts:
+    model_degradation_threshold_pct: 20
+    feature_drift_threshold: 0.3
+    max_consecutive_losses: 5
