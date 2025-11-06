@@ -69,6 +69,52 @@ data:
         min_market_cap_usd: 100000000
       max_pairs: 50
 
+data_quality:
+  # Data quality validation thresholds
+  # CRITICAL: Bad data = bad models = lost money
+
+  validation_thresholds:
+    stock_price:
+      max_missing_pct: 5.0              # Max % of missing values
+      max_zero_volume_pct: 5.0          # Max % of days with zero volume
+      max_outlier_returns_pct: 2.0      # Max % of extreme returns (>50%)
+      volume_spike_std: 10.0            # Volume spike detection (>10 std)
+
+    fundamental:
+      max_missing_pct: 10.0             # Fundamentals can have some gaps
+      filing_delay_min_days: 30         # Min days between period end and filing
+      filing_delay_max_days: 120        # Max days (too slow = suspicious)
+      max_negative_equity_pct: 5.0      # Max % of periods with negative equity
+
+    crypto:
+      max_missing_pct: 3.0              # Crypto data should be complete
+      max_zero_volume_pct: 1.0          # Crypto trades 24/7
+      max_extreme_volatility_pct: 5.0   # Max % of days with >90% moves
+      stablecoin_max_deviation_pct: 2.0 # Stablecoins should stay near $1
+
+    sentiment:
+      max_sudden_spike_multiplier: 100  # Flag >100x mention spikes (bots?)
+      min_mentions_for_valid: 5         # Need minimum mentions
+
+  feature_validation:
+    # Checks for look-ahead bias and feature leakage
+    max_target_correlation: 0.7        # Features shouldn't correlate >0.7 with future target
+    max_leakage_auc: 0.95              # AUC >0.95 suggests leakage
+    max_drift_std: 2.0                 # Distribution shifts >2 std
+
+  monitoring:
+    # Continuous monitoring with PSI
+    psi_warning_threshold: 0.10        # PSI 0.10-0.25 = monitor
+    psi_retrain_threshold: 0.25        # PSI > 0.25 = retrain required
+    min_monitoring_samples: 100        # Min samples for PSI calculation
+    prediction_quality_degradation_threshold: 0.10  # >10% drop = alert
+
+    report_settings:
+      save_reports: true
+      report_dir: "data/validation_reports"
+      keep_reports_days: 30             # Clean up old reports
+      export_summary_csv: true
+
 models:
   model_1_breakout:
     name: "Technical Breakout Classifier"

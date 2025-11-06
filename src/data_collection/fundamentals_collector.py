@@ -13,6 +13,8 @@ from tqdm import tqdm
 from sec_edgar_downloader import Downloader
 from src.utils.logging_config import setup_logging
 from src.utils.sec_edgar_parser import SECEDGARParser
+from src.utils.data_quality import FundamentalDataValidator
+from src.utils.validation_reports import ValidationReportManager
 
 logger = setup_logging('data_collection')
 
@@ -106,7 +108,8 @@ def collect_fundamentals_for_ticker(
     forms: List[str] = ['10-K', '10-Q'],
     after_date: str = "2015-01-01",
     sec_dir: str = "data/raw/sec_filings",
-    output_dir: str = "data/raw/fundamentals"
+    output_dir: str = "data/raw/fundamentals",
+    report_manager: Optional[ValidationReportManager] = None
 ) -> bool:
     """
     Complete pipeline: download filings and extract fundamentals for one ticker.
@@ -117,9 +120,10 @@ def collect_fundamentals_for_ticker(
         after_date: Download filings after this date
         sec_dir: Directory for SEC filings
         output_dir: Directory for processed fundamentals
+        report_manager: Optional ValidationReportManager for quality checks
 
     Returns:
-        True if successful, False otherwise
+        True if successful (and passes validation), False otherwise
     """
     try:
         # Step 1: Download SEC filings
@@ -161,6 +165,30 @@ def collect_fundamentals_for_ticker(
         if 'filing_date' in df.columns:
             df = df.sort_values('filing_date')
 
+        # Comprehensive validation
+        validator = FundamentalDataValidator(df, ticker)
+        is_valid, issues = validator.run_all_checks()
+
+        # Save validation report if manager provided
+        if report_manager:
+            report_manager.save_validation_report(
+                ticker=ticker,
+                data_type='fundamental',
+                issues=issues,
+                is_valid=is_valid,
+                metadata={'num_rows': len(df), 'forms': forms}
+            )
+
+        # Check for critical issues
+        critical_issues = [i for i in issues if 'CRITICAL' in i or 'DATA ERROR' in i or 'IMPOSSIBLE' in i]
+        if critical_issues:
+            logger.error(f"{ticker}: {len(critical_issues)} CRITICAL data quality issues - REJECTING")
+            return False
+
+        # Accept with warnings
+        if not is_valid and len(issues) > 0:
+            logger.warning(f"{ticker}: Data quality warnings (no critical issues) - ACCEPTING")
+
         # Save to parquet
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
@@ -200,19 +228,41 @@ def collect_all_fundamentals(
 
     success_count = 0
     fail_count = 0
+    validation_reject_count = 0
+
+    # Initialize validation report manager
+    report_manager = ValidationReportManager()
 
     pbar = tqdm(tickers, desc="Collecting fundamentals", unit="ticker")
 
     for ticker in pbar:
-        pbar.set_postfix({'ticker': ticker, 'success': success_count, 'failed': fail_count})
+        pbar.set_postfix({
+            'ticker': ticker,
+            'success': success_count,
+            'failed': fail_count,
+            'rejected': validation_reject_count
+        })
 
-        if collect_fundamentals_for_ticker(ticker, forms, after_date, sec_dir, output_dir):
+        result = collect_fundamentals_for_ticker(ticker, forms, after_date, sec_dir, output_dir, report_manager)
+
+        if result:
             success_count += 1
         else:
-            fail_count += 1
+            # Check if rejection was due to validation
+            issues = report_manager.get_issues_for_ticker(ticker, 'fundamental')
+            critical_issues = [i for i in issues if 'CRITICAL' in i or 'DATA ERROR' in i or 'IMPOSSIBLE' in i]
+            if critical_issues:
+                validation_reject_count += 1
+            else:
+                fail_count += 1
 
     logger.info(f"Fundamentals collection complete!")
-    logger.info(f"Success: {success_count}, Failed: {fail_count}")
+    logger.info(f"Success: {success_count}, Failed: {fail_count}, Rejected (validation): {validation_reject_count}")
+
+    # Print validation summary
+    logger.info("")
+    logger.info("Data Quality Summary:")
+    report_manager.print_summary()
 
 
 def main():

@@ -16,6 +16,8 @@ import os
 from dotenv import load_dotenv
 from tqdm import tqdm
 from src.utils.logging_config import setup_logging
+from src.utils.data_quality import SentimentDataValidator
+from src.utils.validation_reports import ValidationReportManager
 
 logger = setup_logging('data_collection')
 load_dotenv()
@@ -154,7 +156,8 @@ def collect_google_trends(ticker: str, timeframe: str = 'today 3-m') -> Dict:
 def collect_sentiment_for_ticker(
     ticker: str,
     subreddits: List[str],
-    output_dir: str = "data/raw/sentiment"
+    output_dir: str = "data/raw/sentiment",
+    report_manager: Optional[ValidationReportManager] = None
 ) -> bool:
     """
     Collect all sentiment data for a ticker and save to parquet.
@@ -163,9 +166,10 @@ def collect_sentiment_for_ticker(
         ticker: Stock/crypto ticker
         subreddits: List of subreddits to monitor
         output_dir: Output directory
+        report_manager: Optional ValidationReportManager for quality checks
 
     Returns:
-        True if successful
+        True if successful (and passes validation), False otherwise
     """
     try:
         # Collect Reddit data
@@ -186,17 +190,40 @@ def collect_sentiment_for_ticker(
         # Convert to DataFrame
         df = pd.DataFrame([sentiment_data])
 
-        # Save to parquet
+        # Append if file exists (validate combined data)
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
-
         output_file = output_path / f"{ticker}_sentiment.parquet"
 
-        # Append if file exists
         if output_file.exists():
             existing_df = pd.read_parquet(output_file)
             df = pd.concat([existing_df, df], ignore_index=True)
 
+        # Comprehensive validation
+        validator = SentimentDataValidator(df, ticker)
+        is_valid, issues = validator.run_all_checks()
+
+        # Save validation report if manager provided
+        if report_manager:
+            report_manager.save_validation_report(
+                ticker=ticker,
+                data_type='sentiment',
+                issues=issues,
+                is_valid=is_valid,
+                metadata={'num_rows': len(df), 'subreddits': subreddits}
+            )
+
+        # Check for critical issues
+        critical_issues = [i for i in issues if 'CRITICAL' in i or 'DATA ERROR' in i or 'IMPOSSIBLE' in i]
+        if critical_issues:
+            logger.error(f"{ticker}: {len(critical_issues)} CRITICAL data quality issues - REJECTING")
+            return False
+
+        # Accept with warnings
+        if not is_valid and len(issues) > 0:
+            logger.warning(f"{ticker}: Data quality warnings (no critical issues) - ACCEPTING")
+
+        # Save to parquet
         df.to_parquet(output_file, index=False)
 
         logger.debug(f"Saved sentiment data for {ticker}")
@@ -226,25 +253,47 @@ def collect_all_sentiment(
 
     success_count = 0
     fail_count = 0
+    validation_reject_count = 0
 
     # Initialize Reddit once
     reddit = init_reddit()
 
+    # Initialize validation report manager
+    report_manager = ValidationReportManager()
+
     pbar = tqdm(tickers, desc="Collecting sentiment", unit="ticker")
 
     for ticker in pbar:
-        pbar.set_postfix({'ticker': ticker, 'success': success_count, 'failed': fail_count})
+        pbar.set_postfix({
+            'ticker': ticker,
+            'success': success_count,
+            'failed': fail_count,
+            'rejected': validation_reject_count
+        })
 
-        if collect_sentiment_for_ticker(ticker, subreddits, output_dir):
+        result = collect_sentiment_for_ticker(ticker, subreddits, output_dir, report_manager)
+
+        if result:
             success_count += 1
         else:
-            fail_count += 1
+            # Check if rejection was due to validation
+            issues = report_manager.get_issues_for_ticker(ticker, 'sentiment')
+            critical_issues = [i for i in issues if 'CRITICAL' in i or 'DATA ERROR' in i or 'IMPOSSIBLE' in i]
+            if critical_issues:
+                validation_reject_count += 1
+            else:
+                fail_count += 1
 
         # Rate limiting
         time.sleep(1)
 
     logger.info(f"Sentiment collection complete!")
-    logger.info(f"Success: {success_count}, Failed: {fail_count}")
+    logger.info(f"Success: {success_count}, Failed: {fail_count}, Rejected (validation): {validation_reject_count}")
+
+    # Print validation summary
+    logger.info("")
+    logger.info("Data Quality Summary:")
+    report_manager.print_summary()
 
 
 def main():

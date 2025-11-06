@@ -14,7 +14,9 @@ import argparse
 from datetime import datetime, timedelta
 from tqdm import tqdm
 from src.utils.logging_config import setup_logging
-from src.utils.data_validation import validate_ohlcv_data, check_data_freshness
+from src.utils.data_validation import check_data_freshness
+from src.utils.data_quality import CryptoDataValidator
+from src.utils.validation_reports import ValidationReportManager
 
 logger = setup_logging('data_collection')
 
@@ -65,7 +67,8 @@ def download_crypto_ohlcv(
     exchange_name: str = 'binance',
     timeframe: str = '1d',
     start_date: Optional[str] = None,
-    rate_limit_delay: float = 1.0
+    rate_limit_delay: float = 1.0,
+    report_manager: Optional[ValidationReportManager] = None
 ) -> Optional[pd.DataFrame]:
     """
     Download OHLCV data for a cryptocurrency using CCXT.
@@ -76,9 +79,10 @@ def download_crypto_ohlcv(
         timeframe: Timeframe (e.g., '1d', '1h')
         start_date: Start date (YYYY-MM-DD), defaults to earliest available
         rate_limit_delay: Delay between requests (seconds)
+        report_manager: Optional ValidationReportManager for quality checks
 
     Returns:
-        DataFrame with OHLCV data, or None if failed
+        DataFrame with OHLCV data, or None if failed validation
     """
     try:
         # Add delay for rate limiting
@@ -160,18 +164,29 @@ def download_crypto_ohlcv(
         # Add symbol
         df['symbol'] = symbol
 
-        # Validate data
-        df_validate = df.rename(columns={
-            'open': 'Open',
-            'high': 'High',
-            'low': 'Low',
-            'close': 'Close',
-            'volume': 'Volume'
-        })
-        is_valid, issues = validate_ohlcv_data(df_validate, symbol)
+        # Comprehensive validation
+        validator = CryptoDataValidator(df, symbol)
+        is_valid, issues = validator.run_all_checks()
 
-        if not is_valid:
-            logger.warning(f"Data validation failed for {symbol}: {issues}")
+        # Save validation report if manager provided
+        if report_manager:
+            report_manager.save_validation_report(
+                ticker=symbol,
+                data_type='crypto',
+                issues=issues,
+                is_valid=is_valid,
+                metadata={'num_rows': len(df), 'exchange': exchange_name, 'start_date': start_date}
+            )
+
+        # Check for critical issues
+        critical_issues = [i for i in issues if 'CRITICAL' in i or 'DATA ERROR' in i or 'IMPOSSIBLE' in i]
+        if critical_issues:
+            logger.error(f"{symbol}: {len(critical_issues)} CRITICAL data quality issues - REJECTING")
+            return None
+
+        # Accept with warnings
+        if not is_valid and len(issues) > 0:
+            logger.warning(f"{symbol}: Data quality warnings (no critical issues) - ACCEPTING")
 
         logger.debug(f"Downloaded {len(df)} rows for {symbol}")
 
@@ -240,15 +255,25 @@ def download_all_cryptos(
     success_count = 0
     skip_count = 0
     fail_count = 0
+    validation_reject_count = 0
 
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
+
+    # Initialize validation report manager
+    report_manager = ValidationReportManager()
 
     # Progress bar
     pbar = tqdm(symbols, desc="Downloading crypto", unit="symbol")
 
     for symbol in pbar:
-        pbar.set_postfix({'symbol': symbol, 'success': success_count, 'skipped': skip_count, 'failed': fail_count})
+        pbar.set_postfix({
+            'symbol': symbol,
+            'success': success_count,
+            'skipped': skip_count,
+            'failed': fail_count,
+            'rejected': validation_reject_count
+        })
 
         # Check if file exists and is recent
         file_path = output_path / f"{symbol}_USDT.parquet"
@@ -258,8 +283,11 @@ def download_all_cryptos(
                 skip_count += 1
                 continue
 
-        # Download data
-        df = download_crypto_ohlcv(symbol, exchange_name, start_date=start_date, rate_limit_delay=rate_limit_delay)
+        # Download data with validation
+        df = download_crypto_ohlcv(
+            symbol, exchange_name, start_date=start_date,
+            rate_limit_delay=rate_limit_delay, report_manager=report_manager
+        )
 
         if df is not None and len(df) > 0:
             # Save to parquet
@@ -268,10 +296,21 @@ def download_all_cryptos(
             else:
                 fail_count += 1
         else:
-            fail_count += 1
+            # Check if rejection was due to validation
+            issues = report_manager.get_issues_for_ticker(symbol, 'crypto')
+            critical_issues = [i for i in issues if 'CRITICAL' in i or 'DATA ERROR' in i or 'IMPOSSIBLE' in i]
+            if critical_issues:
+                validation_reject_count += 1
+            else:
+                fail_count += 1
 
     logger.info(f"Download complete!")
-    logger.info(f"Success: {success_count}, Skipped: {skip_count}, Failed: {fail_count}")
+    logger.info(f"Success: {success_count}, Skipped: {skip_count}, Failed: {fail_count}, Rejected (validation): {validation_reject_count}")
+
+    # Print validation summary
+    logger.info("")
+    logger.info("Data Quality Summary:")
+    report_manager.print_summary()
 
 
 def main():
